@@ -23,8 +23,8 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"
 
-# Threads (not processes) on purpose: the restore lease/validation state lives
-# in SQLite and every request is handled correctly across processes too, but a
-# single process with a thread pool keeps SQLite contention low.
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "8", \
+# Multiple worker processes with threads each.  All shared state lives in
+# SQLite (WAL + BEGIN IMMEDIATE), so registrations, renewals, restores and
+# queries stay consistent across processes; no per-process cache is trusted.
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "8", \
      "--timeout", "60", "--access-logfile", "-", "svcdir.__main__:app"]

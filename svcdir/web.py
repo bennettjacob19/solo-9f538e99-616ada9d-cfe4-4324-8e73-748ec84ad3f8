@@ -8,7 +8,7 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .errors import DirectoryError, InputError
-from .store import DirectoryStore
+from .store import DirectoryStore, validate_lease_seconds
 
 
 def _store_from_env() -> DirectoryStore:
@@ -107,24 +107,69 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.get("/resolve")
     def resolve():
         name = request.args.get("name")
+        token = request.args.get("token") or None
         with store.read_view() as view:
-            result = view.resolve(name)
+            result = view.resolve(name, token=token)
         body = {
             "ok": True,
             "version": result["version"],
             "restore_in_progress": result["restore_in_progress"],
         }
+        if result.get("lease") is not None:
+            body["lease"] = result["lease"]
         if "address" in result:
             body["name"] = result["name"]
             body["address"] = result["address"]
+            body["kind"] = result["kind"]
+            if result["kind"] == "temporary":
+                body["lease_expires_at"] = result["lease_expires_at"]
+                body["lease_expires_in"] = result["lease_expires_in"]
         else:
             body["count"] = result["count"]
             body["services"] = result["services"]
+            body["entries"] = result["entries"]
         return jsonify(body)
 
     @app.get("/api/state")
     def api_state():
-        return jsonify({"ok": True, **store.snapshot()})
+        token = request.args.get("token")
+        with store.read_view() as view:
+            state = view.snapshot(token=token)
+        return jsonify({"ok": True, **state})
+
+    # -- temporary leases -------------------------------------------------
+
+    @app.post("/api/temporary")
+    def api_register_temporary():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise InputError("请求体必须是 JSON 对象")
+        lease_seconds = payload.get("lease_seconds", payload.get("ttl"))
+        result = store.register_temporary(
+            payload.get("service"), payload.get("address"), lease_seconds
+        )
+        return jsonify({"ok": True, **result}), 201
+
+    @app.post("/api/temporary/<path:service>/renew")
+    def api_renew_temporary(service: str):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        token = payload.get("token", request.headers.get("X-Lease-Token"))
+        result = store.renew_temporary(
+            service,
+            token,
+            payload.get("lease_seconds", payload.get("ttl")),
+        )
+        return jsonify({"ok": True, "renewed": True, **result})
+
+    @app.delete("/api/temporary/<path:service>")
+    def api_revoke_temporary(service: str):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        token = payload.get("token", request.headers.get("X-Lease-Token"))
+        return jsonify({"ok": True, "deleted": True, **store.revoke_temporary(service, token)})
 
     @app.get("/api/backups")
     def api_backups():
@@ -168,9 +213,25 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
 
     @app.get("/")
     def index():
-        snapshot = store.snapshot()
-        return render_template("index.html", state=snapshot, message=request.args.get("message"),
-                               error=request.args.get("error"))
+        token = request.args.get("token")
+        snapshot = store.snapshot(token=token)
+        probe = (request.args.get("probe") or "").strip()
+        probe_result = None
+        probe_error = None
+        if probe:
+            try:
+                probe_result = store.resolve(probe)
+            except DirectoryError as exc:
+                probe_error = exc.message
+        return render_template(
+            "index.html",
+            state=snapshot,
+            message=request.args.get("message"),
+            error=request.args.get("error"),
+            probe=probe,
+            probe_result=probe_result,
+            probe_error=probe_error,
+        )
 
     @app.post("/services")
     def form_upsert():
@@ -191,6 +252,65 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
         return _redirect_back(message=f"已删除 {result['service']}（目录版本 {result['version']}）")
+
+    @app.post("/temporary")
+    def form_register_temporary():
+        token = ""
+        try:
+            result = store.register_temporary(
+                request.form.get("service"),
+                request.form.get("address"),
+                validate_lease_seconds(request.form.get("lease_seconds")),
+            )
+            token = result["token"]
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        # The token is surfaced once, then dropped from the URL/history.
+        return _redirect_back(
+            message=f"已登记临时服务 {result['service']} -> {result['address']}，"
+                    f"租约到期 {result['lease_expires_at']}。"
+                    f"操作凭据（只显示这一次，请立即保存）：{token}"
+        )
+
+    def _form_lease_target(service: str) -> str:
+        """Read the service name from the hidden field, falling back to path.
+
+        One form posts to two actions (renew/revoke), so the real name travels
+        in the body rather than in an action-specific URL.
+        """
+        candidate = (request.form.get("service") or "").strip()
+        if candidate:
+            return candidate
+        if service == "_":
+            raise InputError("缺少服务名")
+        return service
+
+    @app.post("/temporary/<path:service>/renew")
+    def form_renew_temporary(service: str):
+        try:
+            target = _form_lease_target(service)
+            raw_ttl = request.form.get("lease_seconds")
+            result = store.renew_temporary(
+                target,
+                request.form.get("token"),
+                validate_lease_seconds(raw_ttl) if raw_ttl else None,
+            )
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        return _redirect_back(
+            message=f"已续租 {result['service']}，新到期时间 {result['lease_expires_at']}"
+        )
+
+    @app.post("/temporary/<path:service>/revoke")
+    def form_revoke_temporary(service: str):
+        try:
+            target = _form_lease_target(service)
+            result = store.revoke_temporary(target, request.form.get("token"))
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        return _redirect_back(
+            message=f"已撤销临时服务 {result['service']}，该名称现已可重新登记"
+        )
 
     @app.post("/backups")
     def form_create_backup():

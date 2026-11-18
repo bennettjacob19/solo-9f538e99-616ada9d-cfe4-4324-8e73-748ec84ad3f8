@@ -27,6 +27,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -46,16 +47,23 @@ from .errors import (
     DatabaseError,
     DirectoryError,
     InputError,
+    InvalidLeaseCredential,
+    LeaseExpired,
+    NameInUse,
     NotFoundError,
     RestoreInProgress,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BACKUP_FORMAT = "svcdir-backup-v1"
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MIN_LEASE_SECONDS = 30.0
+MAX_LEASE_SECONDS = 300.0
+DEFAULT_LEASE_SECONDS = 60.0
+MAX_LEASE_TOKEN_LENGTH = 512
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -119,8 +127,58 @@ def _clean_note(raw: Any) -> str:
     return raw.strip()[:MAX_NOTE_LENGTH]
 
 
+def validate_lease_seconds(raw: Any) -> float:
+    """Lease length in seconds, clamped to the supported 30-300s range.
+
+    The web form only stores whole seconds; the API also accepts fractional
+    seconds inside the same bounds.
+    """
+    if isinstance(raw, bool) or raw is None:
+        raise InputError(
+            f"租期必须是 {int(MIN_LEASE_SECONDS)}-{int(MAX_LEASE_SECONDS)} 秒之间的数字"
+        )
+    if isinstance(raw, (int, float)):
+        seconds = float(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        try:
+            seconds = float(text)
+        except ValueError:
+            raise InputError(
+                f"租期必须是 {int(MIN_LEASE_SECONDS)}-{int(MAX_LEASE_SECONDS)} 秒之间的数字"
+            ) from None
+    else:
+        raise InputError(
+            f"租期必须是 {int(MIN_LEASE_SECONDS)}-{int(MAX_LEASE_SECONDS)} 秒之间的数字"
+        )
+    if not math.isfinite(seconds) or not (
+        MIN_LEASE_SECONDS <= seconds <= MAX_LEASE_SECONDS
+    ):
+        raise InputError(
+            f"租期必须在 {int(MIN_LEASE_SECONDS)}-{int(MAX_LEASE_SECONDS)} 秒之间"
+        )
+    return seconds
+
+
+def validate_lease_token(raw: Any) -> str:
+    token = _text(raw, "租约凭据")
+    if not token or len(token) > MAX_LEASE_TOKEN_LENGTH:
+        raise InputError("租约凭据不合法")
+    if any(ch.isspace() or ord(ch) < 33 or ord(ch) == 127 for ch in token):
+        raise InputError("租约凭据不合法")
+    return token
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _utc_from_epoch(epoch: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _compute_digest(backup_name: str, version_id: int, entries: tuple[tuple[str, str], ...]) -> str:
@@ -136,6 +194,10 @@ def _compute_digest(backup_name: str, version_id: int, entries: tuple[tuple[str,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _translate_db_error(exc: sqlite3.Error) -> DirectoryError:
@@ -167,29 +229,128 @@ class _PinnedView:
     def restore_in_progress(self) -> bool:
         return self.restore.get("state") == "restoring"
 
-    def resolve(self, name: str | None = None) -> dict:
-        service = validate_service_name(name) if name is not None else None
-        if service is None:
-            rows = self._store._entries(self._conn, self.version)
-            return {
-                "version": self.version,
-                "count": len(rows),
-                "services": dict(rows),
-                "restore_in_progress": self.restore_in_progress,
-                "restore": self.restore,
+    def _now(self) -> float:
+        return self._store._time()
+
+    def _effective(self, now: float) -> dict[str, dict]:
+        """Merge fixed and live temporary entries at ``now``.
+
+        Expiry is evaluated here, at query time, so an elapsed lease vanishes
+        from results immediately -- no clean-up pass is required.  The fixed
+        directory always wins if a name appears in both (registration rejects
+        that case, so it is only a defensive rule).
+        """
+        merged: dict[str, dict] = {}
+        for service, address in self._store._entries(self._conn, self.version):
+            merged[service] = {"service": service, "address": address, "kind": "fixed"}
+        for row in self._conn.execute(
+            "SELECT service, address, lease_expires_at, registered_at "
+            "FROM temp_leases WHERE lease_expires_at > ? ORDER BY service",
+            (now,),
+        ).fetchall():
+            expires = float(row["lease_expires_at"])
+            merged[str(row["service"])] = {
+                "service": str(row["service"]),
+                "address": str(row["address"]),
+                "kind": "temporary",
+                "lease_expires_at": _utc_from_epoch(expires),
+                "lease_expires_in": round(max(0.0, expires - now), 3),
+                "registered_at": str(row["registered_at"]),
             }
+        return merged
+
+    def _lease_for_token(self, token: str | None, now: float) -> dict | None:
+        if token is None:
+            return None
+        try:
+            plain = validate_lease_token(token)
+        except DirectoryError:
+            # ``token`` is optional context on a query; a malformed value just
+            # means there is no lease to report.  Renew/revoke still reject it.
+            return None
         row = self._conn.execute(
-            "SELECT address FROM entries WHERE version_id=? AND service=?",
-            (self.version, service),
+            "SELECT * FROM temp_leases WHERE token_hash=?",
+            (_hash_token(plain),),
         ).fetchone()
         if row is None:
-            raise NotFoundError(f"未知服务: {service}")
+            return None
         return {
-            "version": self.version,
-            "name": service,
+            "service": str(row["service"]),
             "address": str(row["address"]),
+            "registered_at": str(row["registered_at"]),
+            "expires_epoch": float(row["lease_expires_at"]),
+            "expires_at": _utc_from_epoch(float(row["lease_expires_at"])),
+            "expires_in": round(max(0.0, float(row["lease_expires_at"]) - now), 3),
+            "effective": float(row["lease_expires_at"]) > now,
+        }
+
+    def resolve(self, name: str | None = None, *, token: str | None = None) -> dict:
+        service = validate_service_name(name) if name is not None else None
+        now = self._now()
+        effective = self._effective(now)
+        lease = self._lease_for_token(token, now)
+        base = {
+            "version": self.version,
             "restore_in_progress": self.restore_in_progress,
             "restore": self.restore,
+            "lease": lease,
+        }
+        if service is None:
+            ordered = [effective[name] for name in sorted(effective)]
+            return {
+                **base,
+                "count": len(ordered),
+                "services": {e["service"]: e["address"] for e in ordered},
+                "entries": ordered,
+            }
+        entry = effective.get(service)
+        if entry is None:
+            raise NotFoundError(f"未知服务: {service}")
+        return {
+            **base,
+            "name": service,
+            "address": entry["address"],
+            "kind": entry["kind"],
+            "lease_expires_at": entry.get("lease_expires_at"),
+            "lease_expires_in": entry.get("lease_expires_in"),
+        }
+
+    def snapshot(self, *, token: str | None = None) -> dict:
+        """Coherent directory view used by the HTML page and ``/api/state``."""
+        now = self._now()
+        effective = self._effective(now)
+        lease = self._lease_for_token(token, now)
+        backups = [
+            {
+                "name": str(r["name"]),
+                "version": int(r["version_id"]),
+                "created_at": str(r["created_at"]),
+                "digest": str(r["digest"]),
+                "entry_count": int(r["entry_count"]),
+            }
+            for r in self._conn.execute(
+                "SELECT name, version_id, created_at, digest, entry_count "
+                "FROM backups ORDER BY created_at DESC, name"
+            ).fetchall()
+        ]
+        services = [effective[name] for name in sorted(effective)]
+
+        def kind_order(entry: dict) -> int:
+            return 0 if entry["kind"] == "fixed" else 1
+
+        services.sort(key=lambda e: (kind_order(e), e["service"]))
+        return {
+            "version": self.version,
+            "count": len(services),
+            "fixed_count": int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM entries WHERE version_id=?", (self.version,)
+            ).fetchone()["n"]),
+            "services": services,
+            "temporary": [e for e in services if e["kind"] == "temporary"],
+            "restore": self.restore,
+            "backups": backups,
+            "lease": lease,
+            "now": _utc_from_epoch(now),
         }
 
 
@@ -205,13 +366,18 @@ class DirectoryStore:
         timeout: float = 15.0,
         restore_lease_seconds: float = 30.0,
         hooks: dict[str, Callable[[dict], None]] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self._timeout = max(1.0, float(timeout))
         self._lease_seconds = max(0.1, float(restore_lease_seconds))
         self._hooks = dict(hooks or {})
+        self._clock = clock or time.time
         self._init_lock = threading.RLock()
         self._initialized = False
+
+    def _time(self) -> float:
+        return float(self._clock())
 
     # -- infrastructure ---------------------------------------------------
 
@@ -295,12 +461,15 @@ class DirectoryStore:
         ).fetchone()
         if has_meta:
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None or str(row["value"]) != str(SCHEMA_VERSION):
-                raise RuntimeError(
-                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
-                    f"{None if row is None else row['value']}"
-                )
-            return
+            found = None if row is None else str(row["value"])
+            if found == str(SCHEMA_VERSION):
+                return
+            if found == "1":
+                self._migrate_v1_to_v2(conn)
+                return
+            raise RuntimeError(
+                f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 {found}"
+            )
         conn.execute(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -338,6 +507,7 @@ class DirectoryStore:
             )
             """
         )
+        self._create_temp_lease_table(conn)
         now = _utc_now_iso()
         cur = conn.execute(
             "INSERT INTO versions(created_at, kind, note) VALUES (?, 'initial', '初始空目录')",
@@ -347,6 +517,29 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+
+    # Temporary lease entries live outside the immutable version chain: a
+    # lease is mutable state by nature (renew/revoke/expire), while the fixed
+    # directory stays copy-on-write.  Queries merge both at read time.
+    def _create_temp_lease_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE temp_leases (
+                service TEXT PRIMARY KEY,
+                address TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                registered_at TEXT NOT NULL,
+                lease_expires_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_temp_leases_expiry ON temp_leases(lease_expires_at)"
+        )
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        self._create_temp_lease_table(conn)
+        self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
 
     # -- meta helpers -----------------------------------------------------
 
@@ -385,7 +578,7 @@ class DirectoryStore:
         if raw is None:
             return True
         try:
-            return float(raw) <= time.time()
+            return float(raw) <= self._time()
         except ValueError:
             return True
 
@@ -521,10 +714,10 @@ class DirectoryStore:
 
     # -- public reads -----------------------------------------------------
 
-    def resolve(self, name: str | None = None) -> dict:
+    def resolve(self, name: str | None = None, *, token: Any = None) -> dict:
         self._ensure_ready()
         with self.read_view() as view:
-            return view.resolve(name)
+            return view.resolve(name, token=token)
 
     def list_backups(self) -> list[dict]:
         self._ensure_ready()
@@ -544,35 +737,11 @@ class DirectoryStore:
             for r in rows
         ]
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, token: Any = None) -> dict:
         """Coherent view used by the HTML page and ``/api/state``."""
         self._ensure_ready()
-        with self._txn(write=False) as conn:
-            version = self._current_version(conn)
-            rows = self._entries(conn, version)
-            restore = self._restore_summary(conn)
-            backups = [
-                {
-                    "name": str(r["name"]),
-                    "version": int(r["version_id"]),
-                    "created_at": str(r["created_at"]),
-                    "digest": str(r["digest"]),
-                    "entry_count": int(r["entry_count"]),
-                }
-                for r in conn.execute(
-                    "SELECT name, version_id, created_at, digest, entry_count "
-                    "FROM backups ORDER BY created_at DESC, name"
-                ).fetchall()
-            ]
-        return {
-            "version": version,
-            "count": len(rows),
-            "services": [
-                {"service": s, "address": a} for s, a in rows
-            ],
-            "restore": restore,
-            "backups": backups,
-        }
+        with self.read_view() as view:
+            return view.snapshot(token=token)
 
     def ping(self) -> None:
         self._ensure_ready()
@@ -608,6 +777,15 @@ class DirectoryStore:
                 "SELECT COUNT(*) AS n FROM entries WHERE version_id=?", (previous,)
             ).fetchone()["n"] >= MAX_SERVICES:
                 raise InputError(f"服务数量超出上限 {MAX_SERVICES}")
+            row = conn.execute(
+                "SELECT lease_expires_at FROM temp_leases WHERE service=?", (svc,)
+            ).fetchone()
+            if row is not None and float(row["lease_expires_at"]) > self._time():
+                raise NameInUse(
+                    f"服务名 {svc} 正被一个有效的临时租约占用，"
+                    "请等租约到期或由持有者撤销后再登记"
+                )
+            self._purge_expired_leases(conn, self._time())
             new_version = self._create_version(
                 conn, previous, "update", clean_note or f"设置 {svc}"
             )
@@ -672,6 +850,150 @@ class DirectoryStore:
             "digest": digest,
             "entry_count": len(entries),
         }
+
+    # -- temporary lease entries ------------------------------------------
+
+    def _purge_expired_leases(self, conn: sqlite3.Connection, now: float) -> int:
+        """Drop rows that are already past their deadline.
+
+        Purely housekeeping: queries filter on the deadline, so an expired
+        lease has already disappeared from results before this runs.
+        """
+        return conn.execute(
+            "DELETE FROM temp_leases WHERE lease_expires_at <= ?", (now,)
+        ).rowcount
+
+    def register_temporary(self, service: Any, address: Any, lease_seconds: Any = None) -> dict:
+        """Register a temporary name with a 30-300s lease; returns the token.
+
+        The token is the only way to renew or revoke this instance.  When the
+        lease elapses the entry leaves the directory by itself (queries filter
+        on the deadline), and the name becomes registrable again.
+        """
+        svc = validate_service_name(service)
+        addr = validate_address(address)
+        seconds = (
+            DEFAULT_LEASE_SECONDS
+            if lease_seconds is None
+            else validate_lease_seconds(lease_seconds)
+        )
+        self._ensure_ready()
+        token = secrets.token_urlsafe(32)
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            now = self._time()
+            previous = self._current_version(conn)
+            self._purge_expired_leases(conn, now)
+            if conn.execute(
+                "SELECT 1 FROM entries WHERE version_id=? AND service=?",
+                (previous, svc),
+            ).fetchone():
+                raise NameInUse(f"服务名 {svc} 已被固定目录占用，不能再登记临时地址")
+            existing = conn.execute(
+                "SELECT lease_expires_at FROM temp_leases WHERE service=?", (svc,)
+            ).fetchone()
+            if existing is not None and float(existing["lease_expires_at"]) > now:
+                raise NameInUse(
+                    f"服务名 {svc} 正被一个有效的临时租约占用，请等租约到期或先撤销"
+                )
+            expires = now + seconds
+            registered_at = _utc_from_epoch(now)
+            conn.execute(
+                "INSERT INTO temp_leases"
+                "(service, address, token_hash, registered_at, lease_expires_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(service) DO UPDATE SET "
+                "address=excluded.address, token_hash=excluded.token_hash, "
+                "registered_at=excluded.registered_at, "
+                "lease_expires_at=excluded.lease_expires_at",
+                (svc, addr, _hash_token(token), registered_at, expires),
+            )
+        self._fire(
+            "after_temporary_registered",
+            {"service": svc, "address": addr, "lease_expires_at": _utc_from_epoch(expires)},
+        )
+        return {
+            "service": svc,
+            "address": addr,
+            "token": token,
+            "lease_seconds": seconds,
+            "lease_expires_at": _utc_from_epoch(expires),
+            "registered_at": registered_at,
+        }
+
+    def _load_live_lease(
+        self, conn: sqlite3.Connection, svc: str, token: str, now: float
+    ) -> dict:
+        """Fetch the live lease addressed by ``token`` or raise.
+
+        A token only ever addresses the instance it was issued for.  Once that
+        instance is gone (expired, revoked, or replaced by a new registration
+        of the same name) the old token matches nothing and cannot touch the
+        new one.
+        """
+        row = conn.execute(
+            "SELECT * FROM temp_leases WHERE token_hash=?", (_hash_token(token),)
+        ).fetchone()
+        if row is None:
+            raise InvalidLeaseCredential(
+                "租约凭据无效：该实例已到期、已撤销，或同名已被重新登记"
+            )
+        if str(row["service"]) != svc:
+            raise InvalidLeaseCredential("租约凭据不属于该服务名")
+        expires = float(row["lease_expires_at"])
+        if expires <= now:
+            raise LeaseExpired(
+                f"服务 {svc} 的租约已于 {_utc_from_epoch(expires)} 到期，无法再操作"
+            )
+        return {
+            "service": str(row["service"]),
+            "address": str(row["address"]),
+            "expires_epoch": expires,
+        }
+
+    def renew_temporary(self, service: Any, token: Any, lease_seconds: Any = None) -> dict:
+        svc = validate_service_name(service)
+        plain = validate_lease_token(token)
+        extras = (
+            {}
+            if lease_seconds is None
+            else {"lease_seconds": validate_lease_seconds(lease_seconds)}
+        )
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            now = self._time()
+            lease = self._load_live_lease(conn, svc, plain, now)
+            if extras:
+                seconds = extras["lease_seconds"]
+            else:
+                seconds = max(MIN_LEASE_SECONDS, lease["expires_epoch"] - now)
+            expires = now + seconds
+            conn.execute(
+                "UPDATE temp_leases SET lease_expires_at=? WHERE token_hash=?",
+                (expires, _hash_token(plain)),
+            )
+        self._fire(
+            "after_temporary_renewed",
+            {"service": svc, "lease_expires_at": _utc_from_epoch(expires)},
+        )
+        return {
+            "service": svc,
+            "address": lease["address"],
+            "lease_seconds": seconds,
+            "lease_expires_at": _utc_from_epoch(expires),
+        }
+
+    def revoke_temporary(self, service: Any, token: Any) -> dict:
+        svc = validate_service_name(service)
+        plain = validate_lease_token(token)
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            lease = self._load_live_lease(conn, svc, plain, self._time())
+            conn.execute("DELETE FROM temp_leases WHERE token_hash=?", (_hash_token(plain),))
+        self._fire("after_temporary_revoked", {"service": svc})
+        return {"service": svc, "address": lease["address"], "revoked": True}
 
     # -- backup validation ------------------------------------------------
 
@@ -775,7 +1097,7 @@ class DirectoryStore:
                         self._meta_set(
                             conn,
                             "restore_lease_until",
-                            f"{time.time() + self._lease_seconds:.6f}",
+                            f"{self._time() + self._lease_seconds:.6f}",
                         )
                 except Exception:  # lease renewal is best-effort; switch rechecks
                     continue
@@ -790,7 +1112,7 @@ class DirectoryStore:
         backup_name = validate_backup_name(name)
         self._ensure_ready()
         owner = secrets.token_hex(16)
-        now = time.time()
+        now = self._time()
         stop_event = threading.Event()
         keeper: threading.Thread | None = None
         lock_fd = self._acquire_restore_lock()
@@ -852,6 +1174,11 @@ class DirectoryStore:
                     conn, validated.version_id, "restore", f"恢复备份 {backup_name}"
                 )
                 self._set_current(conn, new_version)
+                # A successful restore wipes every pre-existing temporary
+                # lease in the same atomic commit: the restored directory is
+                # the whole new state, and old tokens must not resurrect
+                # names into it.
+                revoked = conn.execute("DELETE FROM temp_leases").rowcount
                 self._clear_restore(conn)
 
             result = {
@@ -861,6 +1188,7 @@ class DirectoryStore:
                 "restored_version": validated.version_id,
                 "entry_count": validated.entry_count,
                 "digest": validated.digest,
+                "revoked_leases": revoked,
             }
             self._fire("after_restore_commit", result)
             return result

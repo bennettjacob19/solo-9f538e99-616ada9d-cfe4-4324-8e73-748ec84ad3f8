@@ -10,7 +10,7 @@
 <body>
 <header>
   <h1>本地服务发现目录</h1>
-  <p class="sub">修改服务名到目标地址的映射，创建命名备份，并在需要时从备份恢复。</p>
+  <p class="sub">修改固定映射、登记带租期的临时实例、创建命名备份，并在需要时从备份恢复。</p>
 </header>
 
 <main>
@@ -28,17 +28,34 @@
     <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
     {% if state.services %}
     <table>
-      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <thead><tr><th>服务名</th><th>目标地址</th><th>类型</th><th>到期时间</th><th></th></tr></thead>
       <tbody>
       {% for row in state.services %}
         <tr>
           <td class="mono">{{ row.service }}</td>
           <td class="mono">{{ row.address }}</td>
+          <td>
+            {% if row.kind == 'temporary' %}
+            <span class="tag temp">临时租约</span>
+            {% else %}
+            <span class="tag fixed">固定</span>
+            {% endif %}
+          </td>
+          <td class="mono small">
+            {% if row.kind == 'temporary' %}
+            {{ row.lease_expires_at }}<br>
+            <span class="muted">剩余 {{ "%.0f"|format(row.lease_expires_in) }} 秒</span>
+            {% else %}—{% endif %}
+          </td>
           <td class="right">
+            {% if row.kind == 'fixed' %}
             <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
                   data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
               <button class="danger" type="submit">删除</button>
             </form>
+            {% else %}
+            <span class="muted small">到期自动退出</span>
+            {% endif %}
           </td>
         </tr>
       {% endfor %}
@@ -47,10 +64,113 @@
     {% else %}
     <p class="muted">目录为空。请在下方添加服务。</p>
     {% endif %}
+    <p class="muted small">
+      临时项在租约到期时立即从查询结果中消失，无需等待清理；同名可重新登记，
+      旧凭据无法操作新实例。
+    </p>
   </section>
 
   <section class="card">
-    <h2>新增 / 修改服务</h2>
+    <h2>登记临时服务（30–300 秒租约）</h2>
+    <form method="post" action="{{ url_for('form_register_temporary') }}" class="grid">
+      <label>服务名
+        <input name="service" required maxlength="128" placeholder="worker-1">
+      </label>
+      <label>目标地址
+        <input name="address" required maxlength="512" placeholder="10.0.0.21:9000">
+      </label>
+      <label>租期（秒）
+        <select name="lease_seconds">
+          <option value="30">30</option>
+          <option value="60" selected>60</option>
+          <option value="120">120</option>
+          <option value="300">300</option>
+        </select>
+      </label>
+      <button type="submit">登记并取得凭据</button>
+    </form>
+    <p class="muted small">
+      登记成功后会一次性显示租约凭据；凭据仅用于续租和撤销。凭据遗失后无法找回，
+      只能等租约到期。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>临时租约操作</h2>
+    {% if state.lease %}
+    <div class="flash {{ 'ok' if state.lease.effective else 'bad' }}">
+      <strong class="mono">{{ state.lease.service }}</strong> →
+      <span class="mono">{{ state.lease.address }}</span><br>
+      到期时间 {{ state.lease.expires_at }}
+      {% if state.lease.effective %}
+      （剩余 {{ "%.0f"|format(state.lease.expires_in) }} 秒）
+      {% else %}
+      （已到期，凭据不可再用于续租或撤销）
+      {% endif %}
+    </div>
+    {% endif %}
+    <form method="post" action="{{ url_for('form_renew_temporary', service='_') }}"
+          class="grid lease-form">
+      <label>服务名
+        <input name="service" required maxlength="128"
+               value="{{ state.lease.service if state.lease else '' }}" placeholder="worker-1">
+      </label>
+      <label>租约凭据
+        <input name="token" type="password" required maxlength="512"
+               placeholder="登记时取得的凭据" autocomplete="off">
+      </label>
+      <label>续租到（秒）
+        <select name="lease_seconds">
+          <option value="">保持当前剩余租期</option>
+          <option value="30">30</option>
+          <option value="60">60</option>
+          <option value="120">120</option>
+          <option value="300">300</option>
+        </select>
+      </label>
+      <div class="actions">
+        <button type="submit">续租</button>
+        <button class="danger" type="submit"
+                formaction="{{ url_for('form_revoke_temporary', service='_') }}"
+                data-confirm="确认撤销 {name} 的临时租约？">撤销</button>
+      </div>
+    </form>
+    <p class="muted small">
+      续租或撤销需要「服务名 + 凭据」。租约到期后同名可被重新登记，旧凭据随之失效。
+    </p>
+    <form method="get" action="{{ url_for('index') }}" class="inline">
+      <input name="token" maxlength="512" placeholder="粘贴凭据查看它当前指向的实例" autocomplete="off">
+      <button type="submit">查看</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>试查服务</h2>
+    <form method="get" action="{{ url_for('index') }}" class="inline">
+      <input name="probe" value="{{ probe }}" required maxlength="128"
+             placeholder="服务名，例如 worker-1">
+      <button type="submit">查询</button>
+    </form>
+    {% if probe_result %}
+    <div class="flash ok">
+      <strong class="mono">{{ probe_result.name }}</strong> →
+      <span class="mono">{{ probe_result.address }}</span>
+      {% if probe_result.kind == 'temporary' %}
+      （临时租约，到期 {{ probe_result.lease_expires_at }}，
+      剩余 {{ "%.0f"|format(probe_result.lease_expires_in) }} 秒）
+      {% else %}（固定项）{% endif %}
+    </div>
+    {% elif probe_error %}
+    <div class="flash bad" role="alert">{{ probe_error }}</div>
+    {% endif %}
+    <p class="muted small">
+      结果只包含查询时仍有效的临时项与固定项；同一接口：
+      <span class="mono">GET /resolve?name=&lt;服务名&gt;</span>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>新增 / 修改固定项</h2>
     <form method="post" action="{{ url_for('form_upsert') }}" class="grid">
       <label>服务名
         <input name="service" required maxlength="128" placeholder="orders-api">
@@ -72,7 +192,8 @@
       <button type="submit">创建备份</button>
     </form>
     <p class="muted small">
-      备份在创建时固定一个完整的目录版本，之后的修改不会影响它。
+      备份在创建时固定一个完整的目录版本（只含固定项），之后的修改不会影响它。
+      恢复成功会作废全部临时租约；恢复失败则目录与租约都保持原状。
     </p>
 
     {% if state.backups %}
@@ -103,7 +224,15 @@
 
   <section class="card">
     <h2>查询 API</h2>
-    <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="mono small">
+      GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）<br>
+      GET /resolve?name=&lt;服务名&gt;&amp;token=&lt;凭据&gt;（同时返回该凭据对应租约的状态）<br>
+      POST /api/temporary &nbsp;·&nbsp; POST /api/temporary/&lt;名&gt;/renew &nbsp;·&nbsp;
+      DELETE /api/temporary/&lt;名&gt;
+    </p>
+    <p class="muted small">
+      命名备份与恢复只覆盖固定项；恢复成功会同时作废全部临时租约，恢复失败则保持原状。
+    </p>
   </section>
 </main>
 </body>

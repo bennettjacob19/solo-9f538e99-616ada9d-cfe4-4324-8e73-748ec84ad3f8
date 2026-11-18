@@ -696,6 +696,332 @@ def test_backup_row_pins_one_version_during_continuous_writes(store):
 
 
 # ---------------------------------------------------------------------------
+# Temporary leases
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture()
+def lease_store(tmp_path):
+    clock = FakeClock()
+    store = DirectoryStore(tmp_path / "lease.sqlite3", clock=clock)
+    return store, clock
+
+
+def test_temporary_registration_resolves_until_expiry_without_cleanup(lease_store):
+    store, clock = lease_store
+    result = store.register_temporary("worker", "10.0.0.9:9000", 30)
+    assert result["token"]
+    assert store.resolve("worker")["address"] == "10.0.0.9:9000"
+    assert store.resolve("worker")["kind"] == "temporary"
+
+    clock.advance(29.9)
+    assert store.resolve("worker")["address"] == "10.0.0.9:9000"
+    # Expiry is decided at query time; nothing has to be swept first.
+    clock.advance(0.2)
+    with pytest.raises(NotFoundError):
+        store.resolve("worker")
+    assert "worker" not in store.resolve()["services"]
+    assert store.resolve()["entries"] == []
+
+
+def test_restart_respects_original_deadline(tmp_path):
+    clock = FakeClock()
+    store = DirectoryStore(tmp_path / "d.sqlite3", clock=clock)
+    store.register_temporary("worker", "addr", 30)
+    del store
+
+    restarted = DirectoryStore(tmp_path / "d.sqlite3", clock=clock)
+    assert restarted.resolve("worker")["address"] == "addr"
+    clock.advance(31)
+    with pytest.raises(NotFoundError):
+        DirectoryStore(tmp_path / "d.sqlite3", clock=clock).resolve("worker")
+
+
+def test_lease_bounds_are_enforced(lease_store):
+    store, _ = lease_store
+    for bad in (29, 301, 0, -5, "abc", True, float("nan"), float("inf")):
+        with pytest.raises(Exception):
+            store.register_temporary("w", "a", bad)
+    # Omitted means the default lease.
+    assert store.register_temporary("w", "a", None)["lease_seconds"] == 60
+    assert store.register_temporary("ok", "a", "30")["lease_seconds"] == 30
+    assert store.register_temporary("max", "a", 300)["lease_seconds"] == 300
+
+
+def test_renew_and_revoke_require_matching_live_token(lease_store):
+    store, clock = lease_store
+    reg = store.register_temporary("worker", "addr-1", 30)
+    token = reg["token"]
+
+    with pytest.raises(Exception):
+        store.renew_temporary("worker", "bogus")
+    with pytest.raises(Exception):
+        store.revoke_temporary("worker", "bogus")
+    with pytest.raises(Exception):
+        store.renew_temporary("other", token)
+
+    clock.advance(20)
+    renewed = store.renew_temporary("worker", token, 60)
+    assert renewed["lease_expires_at"] == store.resolve("worker")["lease_expires_at"]
+    assert store.resolve("worker")["lease_expires_in"] == pytest.approx(60, abs=0.01)
+
+    revoked = store.revoke_temporary("worker", token)
+    assert revoked["revoked"] is True
+    with pytest.raises(NotFoundError):
+        store.resolve("worker")
+    with pytest.raises(Exception):
+        store.revoke_temporary("worker", token)
+
+
+def test_expired_token_cannot_touch_new_registration_of_same_name(lease_store):
+    store, clock = lease_store
+    old = store.register_temporary("worker", "old-addr", 30)
+    clock.advance(31)
+    with pytest.raises(NotFoundError):
+        store.resolve("worker")
+
+    new = store.register_temporary("worker", "new-addr", 30)
+    assert new["token"] != old["token"]
+    assert store.resolve("worker")["address"] == "new-addr"
+
+    # The old credential addresses an instance that no longer exists.
+    with pytest.raises(Exception):
+        store.renew_temporary("worker", old["token"], 30)
+    with pytest.raises(Exception):
+        store.revoke_temporary("worker", old["token"])
+    # ... and neither can it harm the new lease.
+    assert store.resolve("worker")["address"] == "new-addr"
+    assert store.renew_temporary("worker", new["token"], 60)["service"] == "worker"
+
+
+def test_registering_live_name_is_rejected(lease_store):
+    store, clock = lease_store
+    store.register_temporary("worker", "a", 30)
+    with pytest.raises(Exception):
+        store.register_temporary("worker", "b", 30)
+    clock.advance(31)
+    # Expired: the name is free again.
+    assert store.register_temporary("worker", "b", 30)["address"] == "b"
+
+
+def test_fixed_entry_cannot_take_name_with_live_lease(lease_store):
+    store, clock = lease_store
+    store.register_temporary("worker", "a", 30)
+    with pytest.raises(Exception):
+        store.upsert("worker", "fixed")
+    # An expired lease no longer blocks the fixed directory.
+    clock.advance(31)
+    store.upsert("worker", "fixed")
+    assert store.resolve("worker")["kind"] == "fixed"
+    # A fixed entry blocks new temporary registrations for the same name.
+    with pytest.raises(Exception):
+        store.register_temporary("worker", "temp", 30)
+
+
+def test_full_directory_mixes_fixed_and_valid_temporary_only(lease_store):
+    store, clock = lease_store
+    store.upsert("fixed-a", "f1")
+    store.register_temporary("temp-a", "t1", 30)
+    store.register_temporary("temp-b", "t2", 30)
+    clock.advance(31)
+    store.register_temporary("temp-c", "t3", 30)
+
+    directory = store.resolve()
+    assert directory["services"] == {"fixed-a": "f1", "temp-c": "t3"}
+    kinds = {e["service"]: e["kind"] for e in directory["entries"]}
+    assert kinds == {"fixed-a": "fixed", "temp-c": "temporary"}
+    for entry in directory["entries"]:
+        if entry["kind"] == "temporary":
+            assert "lease_expires_at" in entry
+
+
+def test_backup_contains_only_fixed_entries(lease_store):
+    store, clock = lease_store
+    store.upsert("fixed", "f")
+    store.register_temporary("temp", "t", 30)
+    backup = store.create_backup("snap")
+    assert backup["entry_count"] == 1
+    with sqlite3.connect(store.db_path) as conn:
+        rows = dict(
+            conn.execute(
+                "SELECT service, address FROM entries WHERE version_id=?",
+                (backup["version"],),
+            ).fetchall()
+        )
+    assert rows == {"fixed": "f"}
+
+
+def test_successful_restore_revokes_all_temporary_leases(lease_store):
+    store, clock = lease_store
+    store.upsert("fixed", "f")
+    store.create_backup("snap")
+    live = store.register_temporary("temp-live", "t", 300)
+    expired = store.register_temporary("temp-expired", "t", 30)
+    clock.advance(31)
+
+    result = store.restore_backup("snap")
+    assert result["revoked_leases"] == 2
+    clock.advance(-31)
+    with pytest.raises(NotFoundError):
+        store.resolve("temp-live")
+    assert store.resolve()["services"] == {"fixed": "f"}
+    with pytest.raises(Exception):
+        store.renew_temporary("temp-live", live["token"], 30)
+    with pytest.raises(Exception):
+        store.revoke_temporary("temp-live", live["token"])
+    with pytest.raises(Exception):
+        store.revoke_temporary("temp-expired", expired["token"])
+
+
+def test_failed_restore_keeps_leases_and_directory(lease_store):
+    store, clock = lease_store
+    store.upsert("fixed", "f")
+    backup = store.create_backup("snap")
+    store.upsert("fixed", "live")  # detach the live version from the backup rows
+    reg = store.register_temporary("temp", "t", 300)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE entries SET address='tampered' WHERE version_id=? AND service='fixed'",
+            (backup["version"],),
+        )
+    with pytest.raises(BackupValidationError):
+        store.restore_backup("snap")
+    assert store.resolve("temp")["address"] == "t"
+    assert store.resolve("fixed")["address"] == "live"
+    # The credential still works after a failed restore.
+    assert store.renew_temporary("temp", reg["token"], 60)["service"] == "temp"
+
+
+def test_offline_lease_keeps_working_after_restart(lease_store, tmp_path):
+    store, clock = lease_store
+    reg = store.register_temporary("worker", "addr", 120)
+    token = reg["token"]
+    restarted = DirectoryStore(tmp_path / "lease.sqlite3", clock=clock)
+    assert restarted.renew_temporary("worker", token, 300)["service"] == "worker"
+    assert restarted.resolve("worker")["address"] == "addr"
+
+
+def test_expired_lease_rows_are_only_housekeeping(lease_store):
+    """Expiry is a query-time decision; stale rows may linger harmlessly."""
+    store, clock = lease_store
+    reg = store.register_temporary("worker", "a", 30)
+    clock.advance(31)
+    # Simulate an abandoned row still sitting in the table.
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute("SELECT service FROM temp_leases").fetchall()
+    assert rows == [("worker",)]
+    assert store.resolve()["services"] == {}
+    # A new registration may reuse the name and replaces the stale row.
+    fresh = store.register_temporary("worker", "b", 30)
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute("SELECT service FROM temp_leases").fetchall()
+    assert rows == [("worker",)]
+    assert fresh["address"] == "b"
+    with pytest.raises(Exception):
+        store.renew_temporary("worker", reg["token"], 30)
+
+
+def test_concurrent_registrations_of_one_name_have_one_winner(lease_store):
+    store, _ = lease_store
+    results: list[dict] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(8)
+
+    def register(i: int) -> None:
+        barrier.wait()
+        try:
+            results.append(store.register_temporary("race", f"addr-{i}", 30))
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=register, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+
+    assert len(results) == 1, (results, errors)
+    assert len(errors) == 7
+    winner = results[0]
+    assert store.resolve("race")["address"] == winner["address"]
+    assert store.renew_temporary("race", winner["token"], 60)["service"] == "race"
+
+
+def test_lease_writes_rejected_during_restore(lease_store):
+    store, _ = lease_store
+    store.upsert("a", "1")
+    store.create_backup("snap")
+    reg = store.register_temporary("temp", "t", 300)
+
+    gate = BlockingHooks().install(store, "validated")
+    t = threading.Thread(target=store.restore_backup, args=("snap",))
+    t.start()
+    assert gate.reached.wait(10)
+
+    with pytest.raises(RestoreInProgress):
+        store.register_temporary("other", "x", 30)
+    with pytest.raises(RestoreInProgress):
+        store.renew_temporary("temp", reg["token"], 60)
+    with pytest.raises(RestoreInProgress):
+        store.revoke_temporary("temp", reg["token"])
+
+    gate.release.set()
+    t.join(10)
+    # The restore committed, so the lease is gone along with it.
+    with pytest.raises(NotFoundError):
+        store.resolve("temp")
+
+
+def test_concurrent_lease_writes_and_queries_stay_consistent(lease_store):
+    store, clock = lease_store
+    stop = threading.Event()
+    problems: list[dict] = []
+    registered: list[dict] = []
+
+    def registrar() -> None:
+        i = 0
+        while not stop.is_set():
+            try:
+                registered.append(store.register_temporary(f"w{i % 5}", f"a-{i}", 30))
+            except Exception:  # noqa: BLE001 - duplicates are expected
+                pass
+            i += 1
+
+    def reader() -> None:
+        while not stop.is_set():
+            directory = store.resolve()
+            for entry in directory["entries"]:
+                if entry["kind"] == "temporary" and entry["lease_expires_in"] <= 0:
+                    problems.append(entry)
+            if directory["services"] != {
+                e["service"]: e["address"] for e in directory["entries"]
+            }:
+                problems.append(directory)
+
+    threads = [threading.Thread(target=registrar) for _ in range(3)]
+    threads += [threading.Thread(target=reader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(0.3)
+    stop.set()
+    for t in threads:
+        t.join(10)
+
+    assert registered
+    assert not problems, problems[:3]
+
+
+# ---------------------------------------------------------------------------
 # HTTP layer
 
 
@@ -781,3 +1107,229 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Temporary leases over HTTP
+
+
+@pytest.fixture()
+def lease_client(tmp_path):
+    clock = FakeClock()
+    app = create_app(DirectoryStore(tmp_path / "lease-web.sqlite3", clock=clock))
+    app.config.update(TESTING=True)
+    return app.test_client(), clock
+
+
+def test_api_temporary_lifecycle(lease_client):
+    client, clock = lease_client
+    resp = client.post(
+        "/api/temporary",
+        json={"service": "worker", "address": "10.0.0.3:9000", "lease_seconds": 30},
+    )
+    assert resp.status_code == 201
+    body = resp.get_json()
+    token = body["token"]
+    assert body["lease_expires_at"].endswith("Z")
+
+    resolved = client.get("/resolve?name=worker").get_json()
+    assert resolved["address"] == "10.0.0.3:9000"
+    assert resolved["kind"] == "temporary"
+    assert resolved["lease_expires_in"] == pytest.approx(30, abs=0.01)
+
+    # A malformed token must not break a plain lookup.
+    assert client.get("/resolve?name=worker&token=%20%20").get_json()["address"] == "10.0.0.3:9000"
+    assert client.get("/resolve?token=bad%20token").status_code == 200
+
+    renewed = client.post(
+        "/api/temporary/worker/renew", json={"token": token, "lease_seconds": 120}
+    )
+    assert renewed.status_code == 200
+    assert client.get("/resolve?name=worker").get_json()["lease_expires_in"] == pytest.approx(
+        120, abs=0.01
+    )
+
+    # The full directory lists it with its expiry.
+    directory = client.get("/resolve").get_json()
+    assert directory["services"] == {"worker": "10.0.0.3:9000"}
+    assert directory["entries"][0]["kind"] == "temporary"
+
+    clock.advance(121)
+    assert client.get("/resolve?name=worker").status_code == 404
+    assert client.get("/resolve").get_json()["services"] == {}
+
+    # Re-registered under the same name; the old token no longer works.
+    fresh = client.post(
+        "/api/temporary", json={"service": "worker", "address": "new", "lease_seconds": 30}
+    ).get_json()
+    assert fresh["token"] != token
+    stale = client.post("/api/temporary/worker/renew", json={"token": token, "lease_seconds": 30})
+    assert stale.status_code == 403
+    assert stale.get_json()["error"]["code"] == "lease_invalid"
+    assert client.get("/resolve?name=worker").get_json()["address"] == "new"
+
+    revoked = client.delete(
+        "/api/temporary/worker", headers={"X-Lease-Token": fresh["token"]}
+    )
+    assert revoked.status_code == 200
+    assert client.get("/resolve?name=worker").status_code == 404
+
+
+def test_api_temporary_validation_and_conflicts(lease_client):
+    client, clock = lease_client
+    for ttl in (29, 301, "x"):
+        resp = client.post(
+            "/api/temporary", json={"service": "w", "address": "a", "lease_seconds": ttl}
+        )
+        assert resp.status_code == 400, ttl
+    assert client.post(
+        "/api/temporary", json={"service": "bad name", "address": "a", "lease_seconds": 30}
+    ).status_code == 400
+    assert client.post("/api/temporary", data="nope").status_code == 400
+
+    assert client.post("/api/services", json={"service": "fixed", "address": "f"}).status_code == 200
+    conflict = client.post(
+        "/api/temporary", json={"service": "fixed", "address": "t", "lease_seconds": 30}
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["error"]["code"] == "name_in_use"
+
+    client.post("/api/temporary", json={"service": "held", "address": "t", "lease_seconds": 30})
+    dup = client.post(
+        "/api/temporary", json={"service": "held", "address": "t", "lease_seconds": 30}
+    )
+    assert dup.status_code == 409
+    assert client.post("/api/services", json={"service": "held", "address": "f"}).status_code == 409
+    clock.advance(31)
+    assert client.post("/api/services", json={"service": "held", "address": "f"}).status_code == 200
+
+    # Renewing an elapsed lease is a distinct, explicit outcome.
+    reg = client.post(
+        "/api/temporary", json={"service": "gone", "address": "t", "lease_seconds": 30}
+    ).get_json()
+    clock.advance(31)
+    expired = client.post(
+        "/api/temporary/gone/renew", json={"token": reg["token"], "lease_seconds": 30}
+    )
+    assert expired.status_code == 410
+    assert expired.get_json()["error"]["code"] == "lease_expired"
+
+
+def test_api_state_reports_expiry_and_token_view(lease_client):
+    client, clock = lease_client
+    token = client.post(
+        "/api/temporary",
+        json={"service": "worker", "address": "a", "lease_seconds": 30},
+    ).get_json()["token"]
+    state = client.get("/api/state").get_json()
+    assert state["temporary"][0]["service"] == "worker"
+    assert state["temporary"][0]["lease_expires_at"]
+    assert state["fixed_count"] == 0
+
+    with_token = client.get(f"/api/state?token={token}").get_json()
+    assert with_token["lease"]["service"] == "worker"
+    assert with_token["lease"]["effective"] is True
+    clock.advance(31)
+    after = client.get(f"/api/state?token={token}").get_json()
+    assert after["lease"]["effective"] is False
+    assert after["temporary"] == []
+    # The token itself is never echoed back.
+    assert token not in client.get("/api/state").get_data(as_text=True)
+
+
+def test_html_page_shows_leases_and_supports_operations(lease_client):
+    client, clock = lease_client
+    page = client.get("/").get_data(as_text=True)
+    assert "30–300" in page
+
+    resp = client.post(
+        "/temporary",
+        data={"service": "worker", "address": "10.0.0.4:80", "lease_seconds": "60"},
+        follow_redirects=True,
+    )
+    text = resp.get_data(as_text=True)
+    assert resp.status_code == 200
+    assert "操作凭据" in text
+    # Parse the one-time token out of the flash message.
+    import re as _re
+
+    token = _re.search(r"操作凭据[^A-Za-z0-9_-]*([A-Za-z0-9_-]{20,})", text).group(1)
+    assert token in text
+
+    indexed = client.get("/").get_data(as_text=True)
+    assert "worker" in indexed
+    assert "10.0.0.4:80" in indexed
+    assert "临时租约" in indexed
+    # Expiry time is displayed on the page.
+    assert "到期时间" in indexed
+    # In-page trial lookup shows the temporary instance and its expiry.
+    probed = client.get("/?probe=worker").get_data(as_text=True)
+    assert "10.0.0.4:80" in probed
+    assert "剩余" in probed
+    missing = client.get("/?probe=ghost").get_data(as_text=True)
+    assert "未知服务: ghost" in missing
+
+    renewed = client.post(
+        "/temporary/worker/renew",
+        data={"service": "worker", "token": token, "lease_seconds": "120"},
+        follow_redirects=True,
+    )
+    assert "已续租 worker" in renewed.get_data(as_text=True)
+
+    bad = client.post(
+        "/temporary/worker/renew",
+        data={"service": "worker", "token": "wrong", "lease_seconds": "120"},
+        follow_redirects=True,
+    )
+    assert "租约凭据无效" in bad.get_data(as_text=True)
+
+    revoked = client.post(
+        "/temporary/worker/revoke",
+        data={"service": "worker", "token": token},
+        follow_redirects=True,
+    )
+    assert "已撤销临时服务 worker" in revoked.get_data(as_text=True)
+    assert client.get("/resolve?name=worker").status_code == 404
+
+
+def test_html_register_rejects_out_of_range_lease(lease_client):
+    client, _ = lease_client
+    resp = client.post(
+        "/temporary",
+        data={"service": "worker", "address": "a", "lease_seconds": "10"},
+        follow_redirects=True,
+    )
+    assert "30-300" in resp.get_data(as_text=True)
+    assert client.get("/resolve?name=worker").status_code == 404
+
+
+def test_temporary_endpoints_reject_writes_during_restore(tmp_path):
+    store = DirectoryStore(tmp_path / "restore-web.sqlite3")
+    app = create_app(store)
+    app.config.update(TESTING=True)
+    setup = app.test_client()
+    setup.post("/api/services", json={"service": "a", "address": "1"})
+    setup.post("/api/backups", json={"name": "snap"})
+    token = setup.post(
+        "/api/temporary", json={"service": "w", "address": "2", "lease_seconds": 300}
+    ).get_json()["token"]
+
+    gate = BlockingHooks().install(store, "validated")
+    t = threading.Thread(target=store.restore_backup, args=("snap",))
+    t.start()
+    assert gate.reached.wait(10)
+
+    client = app.test_client()
+    for resp in (
+        client.post("/api/temporary", json={"service": "x", "address": "y", "lease_seconds": 30}),
+        client.post("/api/temporary/w/renew", json={"token": token, "lease_seconds": 30}),
+        client.delete("/api/temporary/w", json={"token": token}),
+    ):
+        assert resp.status_code == 409
+        assert resp.get_json()["error"]["code"] == "restore_in_progress"
+    # Reads still include the (soon-to-be-revoked) temporary entry.
+    assert client.get("/resolve?name=w").get_json()["address"] == "2"
+
+    gate.release.set()
+    t.join(10)
+    assert client.get("/resolve?name=w").status_code == 404

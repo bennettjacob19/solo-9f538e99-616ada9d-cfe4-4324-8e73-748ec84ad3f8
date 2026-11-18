@@ -50,6 +50,35 @@ class RestoreInProgress(ConflictError):
         super().__init__(message)
 
 
+class NameInUse(ConflictError):
+    status_code = 409
+    code = "name_in_use"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class LeaseError(DirectoryError):
+    status_code = 403
+    code = "lease_invalid"
+
+
+class InvalidLeaseCredential(LeaseError):
+    status_code = 403
+    code = "lease_invalid"
+
+    def __init__(self, message: str = "租约凭据无效") -> None:
+        super().__init__(message)
+
+
+class LeaseExpired(LeaseError):
+    status_code = 410
+    code = "lease_expired"
+
+    def __init__(self, message: str = "租约已到期") -> None:
+        super().__init__(message)
+
+
 class BackupNameTaken(ConflictError):
     status_code = 409
     code = "backup_name_taken"
